@@ -1,0 +1,240 @@
+import hashlib
+import json
+import random
+from collections import defaultdict
+from web3 import Web3
+import os
+from decimal import Decimal
+
+# Initialize Web3 with Infura (Ethereum)
+infura_url = "https://mainnet.infura.io/v3/4543037f1c3d467da23ff4b25f85e2fd"
+web3 = Web3(Web3.HTTPProvider(infura_url))
+
+if not web3.isConnected():
+    raise ConnectionError("Failed to connect to Web3 provider. Check your Infura URL.")
+
+class OIAToken:
+    HARD_CAP = Decimal("525000000")  # Hard cap of 525,000,000 OIA Tokens
+
+    def __init__(self, rewards_pool=10000, fee_percentage=Decimal("0.00075")):
+        self.balances = defaultdict(Decimal)
+        self.staked_balances = defaultdict(Decimal)
+        self.staking_rewards = defaultdict(Decimal)
+        self.rewards_pool = Decimal(rewards_pool)
+        self.fee_percentage = fee_percentage  # Fee charged as a percentage of the transaction amount
+        self.master_wallet = "MasterWallet"  # Master wallet identifier
+        self.balances[self.master_wallet] = Decimal("100000000")  # Initialize master wallet balance to 100,000,000
+        self.total_supply = Decimal("100000000")  # Initialize total supply to 100,000,000
+
+    def create_account(self, account, initial_balance=Decimal(100)):
+        if account in self.balances:
+            raise ValueError(f"Account {account} already exists")
+        if self.total_supply + initial_balance > OIAToken.HARD_CAP:
+            raise ValueError("Total supply exceeds the hard cap")
+        self.balances[account] = Decimal(initial_balance)
+        self.total_supply += initial_balance
+
+    def transfer(self, sender, recipient, amount):
+        amount = Decimal(amount)
+        if amount <= 0:
+            raise ValueError("Transfer amount must be positive")
+        
+        fee = amount * self.fee_percentage
+        total_amount = amount + fee
+        
+        if self.balances[sender] < total_amount:
+            raise ValueError("Insufficient OIA balance")
+        
+        self.balances[sender] -= total_amount
+        self.balances[recipient] += amount
+        self.balances[self.master_wallet] += fee  # Transfer the fee to the master wallet
+
+    def get_balance(self, account):
+        return self.balances.get(account, Decimal(0))
+
+    def stake_tokens(self, account, amount):
+        amount = Decimal(amount)
+        if amount <= 0:
+            raise ValueError("Stake amount must be positive")
+        if self.balances[account] < amount:
+            raise ValueError("Insufficient OIA balance to stake")
+        self.balances[account] -= amount
+        self.staked_balances[account] += amount
+
+    def unstake_tokens(self, account, amount):
+        amount = Decimal(amount)
+        if amount <= 0:
+            raise ValueError("Unstake amount must be positive")
+        if self.staked_balances[account] < amount:
+            raise ValueError("Insufficient staked OIA balance to unstake")
+        self.staked_balances[account] -= amount
+        self.balances[account] += amount
+
+    def distribute_rewards(self):
+        total_staked = sum(self.staked_balances.values())
+        if total_staked == 0:
+            raise ValueError("No tokens staked")
+        
+        total_rewards = Decimal(0)
+        for account, staked_amount in self.staked_balances.items():
+            reward = (staked_amount / total_staked) * self.rewards_pool
+            self.staking_rewards[account] += reward
+            total_rewards += reward
+        
+        self.rewards_pool -= total_rewards
+
+    def claim_rewards(self, account):
+        reward = self.staking_rewards.get(account, Decimal(0))
+        self.balances[account] += reward
+        self.staking_rewards[account] = Decimal(0)
+        return reward
+
+    def get_master_wallet_balance(self):
+        return self.balances[self.master_wallet]
+
+class Block:
+    def __init__(self, previous_hash, transactions, block_type, validator=None):
+        self.previous_hash = previous_hash
+        self.transactions = transactions
+        self.block_type = block_type  # UTXO, EVM, PoW, PoS
+        self.validator = validator
+        self.nonce = 0
+        self.hash = self.calculate_hash()
+
+    def calculate_hash(self):
+        block_string = json.dumps(self.__dict__, sort_keys=True).encode()
+        return hashlib.sha256(block_string).hexdigest()
+
+    def mine_block(self, difficulty):
+        target = '0' * difficulty
+        while not self.hash.startswith(target):
+            self.nonce += 1
+            self.hash = self.calculate_hash()
+
+class UTXOTransaction:
+    def __init__(self, sender, recipient, amount, utxos):
+        self.sender = sender
+        self.recipient = recipient
+        self.amount = Decimal(amount)
+        self.utxos = utxos
+        self.hash = self.calculate_hash()
+
+    def calculate_hash(self):
+        tx_string = f'{self.sender}{self.recipient}{self.amount}{self.utxos}'
+        return hashlib.sha256(tx_string.encode()).hexdigest()
+
+class EVMTransaction:
+    def __init__(self, sender, recipient, amount, data, max_priority_fee_per_gas='2', max_fee_per_gas='50'):
+        self.sender = sender
+        self.recipient = recipient
+        self.amount = Decimal(amount)
+        self.data = data
+        self.max_priority_fee_per_gas = max_priority_fee_per_gas  # Max tip for the miner (in Gwei)
+        self.max_fee_per_gas = max_fee_per_gas  # Max total fee (base fee + priority fee)
+        self.hash = self.calculate_hash()
+
+    def calculate_hash(self):
+        tx_string = f'{self.sender}{self.recipient}{self.amount}{self.data}{self.max_priority_fee_per_gas}{self.max_fee_per_gas}'
+        return hashlib.sha256(tx_string.encode()).hexdigest()
+
+    def send_transaction(self):
+        sender = web3.toChecksumAddress(self.sender)
+        recipient = web3.toChecksumAddress(self.recipient)
+
+        tx = {
+            'from': sender,
+            'to': recipient,
+            'value': web3.toWei(self.amount, 'ether'),
+            'gas': 2000000,
+            'maxFeePerGas': web3.toWei(self.max_fee_per_gas, 'gwei'),
+            'maxPriorityFeePerGas': web3.toWei(self.max_priority_fee_per_gas, 'gwei'),
+            'data': self.data
+        }
+
+        private_key = os.getenv("PRIVATE_KEY")
+        if not private_key:
+            raise ValueError("Private key not found in environment variables")
+
+        try:
+            signed_tx = web3.eth.account.sign_transaction(tx, private_key)
+            tx_hash = web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            return web3.toHex(tx_hash)
+        except Exception as e:
+            raise RuntimeError(f"Failed to send transaction: {str(e)}")
+
+class UTXOBlockchain:
+    def __init__(self, difficulty):
+        self.chain = [self.create_genesis_block()]
+        self.utxo_pool = defaultdict(list)
+        self.difficulty = difficulty
+
+    def create_genesis_block(self):
+        genesis_block = Block("0", [], "UTXO")
+        genesis_block.mine_block(self.difficulty)
+        return genesis_block
+
+    def add_block(self, transactions):
+        previous_block = self.chain[-1]
+        new_block = Block(previous_block.hash, transactions, "UTXO")
+        new_block.mine_block(self.difficulty)
+        if self.validate_block(new_block):
+            self.chain.append(new_block)
+            self.update_utxo_pool(transactions)
+        else:
+            raise ValueError("Invalid block")
+
+    def validate_block(self, block):
+        return block.previous_hash == self.chain[-1].hash and block.hash.startswith('0' * self.difficulty)
+
+    def update_utxo_pool(self, transactions):
+        for tx in transactions:
+            for utxo in tx.utxos:
+                if utxo in self.utxo_pool[tx.sender]:
+                    self.utxo_pool[tx.sender].remove(utxo)
+                else:
+                    raise ValueError("UTXO not found or already spent")
+            self.utxo_pool[tx.recipient].append(tx.hash)
+
+class EVMBlockchain:
+    def __init__(self, validators, stakes, difficulty=1):
+        self.chain = [self.create_genesis_block()]
+        self.accounts = defaultdict(Decimal)
+        self.validators = validators
+        self.stakes = {k: Decimal(v) for k, v in stakes.items()}  # Store stakes as Decimals
+        self.difficulty = difficulty
+
+    def create_genesis_block(self):
+        genesis_block = Block("0", [], "EVM", validator=self.validators[0])
+        genesis_block.mine_block(self.difficulty)
+        return genesis_block
+
+    def add_block(self, transactions):
+        previous_block = self.chain[-1]
+        validator = self.select_validator()
+        new_block = Block(previous_block.hash, transactions, "EVM", validator=validator)
+        new_block.mine_block(self.difficulty)
+        if self.validate_block(new_block):
+            self.chain.append(new_block)
+            self.update_accounts(transactions)
+        else:
+            raise ValueError("Invalid block")
+
+    def select_validator(self):
+        validators = list(self.stakes.keys())
+        weights = list(self.stakes.values())
+        total_stake = sum(weights)
+        if total_stake == 0:
+            raise ValueError("Total stake is zero, cannot select validator")
+        normalized_weights = [w / total_stake for w in weights]
+        return random.choices(validators, weights=normalized_weights)[0]
+
+    def validate_block(self, block):
+        return block.previous_hash == self.chain[-1].hash and block.hash.startswith('0' * self.difficulty)
+
+    def update_accounts(self, transactions):
+        for tx in transactions:
+            if self.accounts[tx.sender] >= tx.amount:
+                self.accounts[tx.sender] -= tx.amount
+                self.accounts[tx.recipient] += tx.amount
+            else:
+                raise ValueError(f"Insufficient funds in account {tx.sender}")
